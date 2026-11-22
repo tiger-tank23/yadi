@@ -1,0 +1,22 @@
+name: Build iPhone JPEG Bridge
+
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build unsigned IPA
+        run: bash build.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhoneBridge-unsigned
+          path: build/PhoneBridge-unsigned.ipa
+          if-no-files-found: error
