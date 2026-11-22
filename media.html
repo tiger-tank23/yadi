@@ -1,0 +1,108 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{color-scheme:dark;font:16px -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#1d1e20;color:#f3f2ec}
+*{box-sizing:border-box}body{margin:0;padding:16px}button,input,select{font:inherit}button,select,.pick{border:0;border-radius:12px;min-height:44px}
+button,select{background:#323537;color:#efefea}button:active,.pick:active{filter:brightness(.82)}button:disabled{opacity:.45}
+[hidden]{display:none!important}
+#stage{position:relative;display:grid;place-items:center;overflow:hidden;aspect-ratio:800/384;border-radius:12px;background:#090b0c}
+#stage[data-empty=true]{background:radial-gradient(ellipse at center,#393328 0%,transparent 78%),repeating-linear-gradient(0deg,#232628 0 1px,transparent 1px 18px),repeating-linear-gradient(90deg,#232628 0 1px,#191c1d 1px 18px)}
+#stage img,#stage video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+#stage:not([data-empty=true]) .empty{display:none}.empty{display:grid;justify-items:center;gap:8px;color:#ccc7bc;font-size:14px}.empty svg{width:40px;height:40px;color:#ffbf50}
+.bar,.actions{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.actions{margin-top:14px}
+.pick{position:relative;overflow:hidden;display:inline-flex;align-items:center;gap:7px;padding:0 13px;background:#ffbf50;color:#201a0e;font-weight:650}.pick b{font-size:20px;font-weight:400}
+.pick input{position:absolute;inset:0;width:100%;height:100%;opacity:0}.pick:focus-within{outline:2px solid white}
+.interval{color:#c4c5c5;font-size:14px;display:flex;align-items:center;gap:6px}select{padding:0 6px}
+#info{margin:12px 0 8px;font-size:15px;font-weight:600;overflow-wrap:anywhere}#player{gap:6px;justify-content:flex-start}
+#player button{padding:0 12px;font-size:14px}#clear{margin-left:auto;background:transparent;color:#d8ad9c}
+@media(max-width:340px){body{padding:10px}#player button{padding:0 8px}}
+</style>
+<div id="stage" data-empty="true"><span class="empty"><svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="4" y="7" width="32" height="25" rx="5"/><circle cx="14" cy="15" r="2.4"/><path d="m6 28 9-8 6 5 6-9 8 9"/></svg>等待添加媒体</span><img id="photo" alt="" hidden><video id="movie" playsinline muted hidden></video></div>
+<div class="actions"><label class="pick"><b aria-hidden="true">＋</b>添加媒体<input id="files" type="file" aria-label="添加图片或视频" accept="image/*,video/*,.mov,.mp4,.m4v" multiple></label>
+<label class="interval">轮播间隔<select id="interval"><option value="2">2 秒</option><option value="5" selected>5 秒</option><option value="10">10 秒</option><option value="30">30 秒</option></select></label></div>
+<p id="info" aria-live="polite" hidden></p>
+<div id="player" class="bar" hidden><button id="previous">上一项</button><button id="toggle">暂停</button><button id="next">下一项</button><button id="clear">清空</button></div>
+<script>
+'use strict';
+const el = id => document.getElementById(id);
+const photo = el('photo'), movie = el('movie'), entries = [];
+let index = 0, currentURL = '', timer, running = true, serial = 0, issue = '';
+const target = document.createElement('canvas');
+let cached = null;
+function update() {
+  el('info').textContent = entries.length ? (index+1)+' / '+entries.length+' · '+entries[index].name+(issue?' · '+issue:'') : '';
+  el('toggle').textContent = running ? '暂停' : '继续';
+  el('stage').dataset.empty = entries.length ? 'false' : 'true';
+  el('player').hidden = !entries.length;
+  el('info').hidden = !entries.length;
+  for (const name of ['previous','next','clear','toggle']) el(name).disabled = !entries.length;
+}
+function next(delta) {
+  if (!entries.length) return;
+  index = (index+delta+entries.length)%entries.length;
+  show();
+}
+function schedule() {
+  clearTimeout(timer);
+  if (running && !photo.hidden && photo.complete && photo.naturalWidth && entries.length>1)
+    timer = setTimeout(()=>next(1), Number(el('interval').value)*1000);
+}
+function playVideo() {
+  const token=serial;
+  movie.play().catch(()=>{
+    if (token!==serial || movie.hidden || !running) return;
+    running=false; issue='请点继续播放'; update();
+  });
+}
+function show() {
+  const token=++serial;
+  clearTimeout(timer); cached=null; issue='';
+  photo.onload=photo.onerror=movie.onerror=movie.onended=null;
+  movie.pause(); movie.removeAttribute('src'); movie.load(); photo.removeAttribute('src');
+  photo.hidden=movie.hidden=true;
+  if (currentURL) URL.revokeObjectURL(currentURL);
+  currentURL='';
+  if (entries.length) {
+    const file=entries[index], isVideo=file.type.startsWith('video/') || /\.(mp4|m4v|mov|webm)$/i.test(file.name);
+    currentURL=URL.createObjectURL(file);
+    const node=isVideo?movie:photo;
+    node.hidden=false;
+    node.onerror=()=>{if(token===serial){issue='此文件无法解码，请切换或换用其他格式';update();}};
+    if(isVideo){
+      movie.onended=()=>{if(token===serial && running) next(1);};
+      movie.src=currentURL;
+      if(running) playVideo();
+    } else {
+      photo.onload=()=>{if(token===serial) schedule();};
+      photo.src=currentURL;
+    }
+  }
+  update();
+}
+el('files').onchange=e=>{
+  const first=!entries.length;
+  for(const file of e.target.files) entries.push(file);
+  e.target.value='';
+  if(first && entries.length){running=true;show();}else{update();schedule();}
+};
+el('previous').onclick=()=>next(-1);el('next').onclick=()=>next(1);
+el('interval').onchange=schedule;
+el('toggle').onclick=()=>{
+  running=!running; issue='';
+  if(!movie.hidden){if(running) playVideo();else movie.pause();}
+  schedule();update();
+};
+el('clear').onclick=()=>{entries.length=0;index=0;show();};
+window.mediaJPEG=(w,h)=>{
+  const source=photo.hidden?movie:photo;
+  const sw=source===movie?movie.videoWidth:photo.naturalWidth,sh=source===movie?movie.videoHeight:photo.naturalHeight;
+  if(!entries.length || !sw || !sh || (source===movie && movie.readyState<2)) return null;
+  if(target.width!==w || target.height!==h){target.width=w;target.height=h;cached=null;}
+  if(source===photo && cached) return cached;
+  const ctx=target.getContext('2d'), k=Math.min(w/sw,h/sh);
+  ctx.fillStyle='black';ctx.fillRect(0,0,w,h);ctx.drawImage(source,(w-sw*k)/2,(h-sh*k)/2,sw*k,sh*k);
+  const frame=target.toDataURL('image/jpeg',0.60).split(',')[1];
+  if(source===photo) cached=frame;
+  return frame;
+};
+update();
+</script></html>

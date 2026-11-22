@@ -121,7 +121,7 @@ static BOOL sendClock(int fd) {
                     int w = p[12]*256+p[13], h = p[14]*256+p[15];
                     if (w < 320 || w > 4096 || h < 160 || h > 2160)
                         return [self fail:@"仪表返回异常画布尺寸" error:error];
-                    _width = w; _height = h; _fps = p[19] ? MIN(10,p[19]) : 10;
+                    _width = w; _height = h; _fps = p[19] ? p[19] : 10;
                     break;
                 }
             }
