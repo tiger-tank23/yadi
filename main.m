@@ -1,5 +1,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
+#import <math.h>
 #import <WebKit/WebKit.h>
 #import "CWJPEGInstrument.h"
 
@@ -16,6 +17,15 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
     UIButton *_settingsButton;
     UILabel *_placeholder;
     NSLayoutConstraint *_sidebarWidth;
+    NSLayoutConstraint *_previewFloor;
+    UIScrollView *_controlsScroll;
+    UIButton *_expand;
+    UIView *_shade;
+    BOOL _expanded, _wanted, _holding, _retryPending;
+    NSUInteger _retryCount;
+    WKNavigation *_navigation;
+    CGFloat _savedBrightness;
+    UIBackgroundTaskIdentifier _backgroundTask;
     int _reported;
     double _windowStart;
     NSUInteger _windowFrames;
@@ -29,6 +39,7 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
+    _backgroundTask = UIBackgroundTaskInvalid;
     self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     self.view.backgroundColor = Ink();
     _worker = dispatch_queue_create("jpeg.instrument", DISPATCH_QUEUE_SERIAL);
@@ -66,6 +77,10 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
     _networkRow = [[UIStackView alloc] initWithArrangedSubviews:@[portLabel,_port]];
     _networkRow.spacing = 8; _port.textAlignment = NSTextAlignmentCenter;
     _settings = [[UIStackView alloc] initWithArrangedSubviews:@[_networkRow,fpsLabel,_rate]];
+    UIButton *shadeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [shadeButton setTitle:@"前台暗屏" forState:UIControlStateNormal];
+    [shadeButton addTarget:self action:@selector(dimDisplay) forControlEvents:UIControlEventTouchUpInside];
+    [_settings addArrangedSubview:shadeButton];
     _settings.axis = UILayoutConstraintAxisVertical; _settings.spacing = 7; _settings.hidden = YES;
     _settingsButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_settingsButton setTitle:@" 连接设置" forState:UIControlStateNormal];
@@ -95,6 +110,18 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
             [surface.trailingAnchor constraintEqualToAnchor:preview.trailingAnchor],
             [surface.topAnchor constraintEqualToAnchor:preview.topAnchor],[surface.bottomAnchor constraintEqualToAnchor:preview.bottomAnchor]]];
     }
+    _expand = [UIButton buttonWithType:UIButtonTypeSystem];
+    _expand.accessibilityLabel = @"放大预览";
+    _expand.tintColor = UIColor.whiteColor;
+    _expand.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.82];
+    _expand.layer.cornerRadius = 16;
+    [_expand setImage:[UIImage systemImageNamed:@"arrow.up.left.and.arrow.down.right"] forState:UIControlStateNormal];
+    [_expand addTarget:self action:@selector(expandPreview) forControlEvents:UIControlEventTouchUpInside];
+    _expand.translatesAutoresizingMaskIntoConstraints = NO;
+    [preview addSubview:_expand];
+    [NSLayoutConstraint activateConstraints:@[[_expand.topAnchor constraintEqualToAnchor:preview.topAnchor constant:6],
+        [_expand.trailingAnchor constraintEqualToAnchor:preview.trailingAnchor constant:-6],
+        [_expand.widthAnchor constraintEqualToConstant:44],[_expand.heightAnchor constraintEqualToConstant:44]]];
     _page.hidden = YES;
     UIStackView *controls = [[UIStackView alloc] initWithArrangedSubviews:@[header,_mode,_settingsButton,_settings,_status]];
     controls.axis = UILayoutConstraintAxisVertical; controls.spacing = 7;
@@ -103,6 +130,7 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
     [NSLayoutConstraint activateConstraints:@[[controls.topAnchor constraintEqualToAnchor:content.topAnchor],
         [controls.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],[controls.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
         [controls.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],[controls.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor]]];
+    _controlsScroll = scroll;
     _sidebarWidth = [scroll.widthAnchor constraintEqualToConstant:270];
     _layout = [[UIStackView alloc] initWithArrangedSubviews:@[scroll,preview]];
     _layout.spacing = 12; _layout.translatesAutoresizingMaskIntoConstraints = NO;
@@ -115,7 +143,10 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
     NSLayoutConstraint *height = [scroll.heightAnchor constraintEqualToAnchor:controls.heightAnchor];
     height.priority = 749; height.active = YES;
     [preview setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisVertical];
+    _previewFloor = [preview.heightAnchor constraintGreaterThanOrEqualToAnchor:_layout.heightAnchor multiplier:0.56];
     [self arrange];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(active:)
+        name:UIApplicationDidBecomeActiveNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(background:)
         name:UIApplicationDidEnterBackgroundNotification object:nil];
 }
@@ -124,7 +155,35 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
 - (void)arrange {
     BOOL wide = self.view.bounds.size.width > self.view.bounds.size.height;
     _layout.axis = wide ? UILayoutConstraintAxisHorizontal : UILayoutConstraintAxisVertical;
-    _sidebarWidth.active = wide;
+    _sidebarWidth.constant = MIN(270, floor(self.view.bounds.size.width*0.32));
+    _sidebarWidth.active = wide && !_expanded;
+    _previewFloor.active = !wide;
+}
+- (void)expandPreview {
+    _expanded = !_expanded;
+    if (_expanded) [_port resignFirstResponder];
+    _controlsScroll.hidden = _expanded;
+    _expand.accessibilityLabel = _expanded ? @"退出大图" : @"放大预览";
+    [_expand setImage:[UIImage systemImageNamed:_expanded ? @"arrow.down.right.and.arrow.up.left" : @"arrow.up.left.and.arrow.down.right"] forState:UIControlStateNormal];
+    [self arrange];
+}
+- (void)dimDisplay {
+    if (!_running || !_frames) { _status.text = @"投屏出画后可开启前台暗屏"; return; }
+    if (_shade) return;
+    _savedBrightness = UIScreen.mainScreen.brightness;
+    UIScreen.mainScreen.brightness = 0.02;
+    UIButton *cover = [UIButton buttonWithType:UIButtonTypeCustom]; cover.backgroundColor = UIColor.blackColor;
+    [cover setTitle:@"轻点恢复亮度" forState:UIControlStateNormal];
+    [cover setTitleColor:UIColor.grayColor forState:UIControlStateNormal];
+    cover.frame = self.view.bounds;
+    cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [cover addTarget:self action:@selector(undim) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:cover]; _shade = cover;
+}
+- (void)undim {
+    if (!_shade) return;
+    UIScreen.mainScreen.brightness = _savedBrightness;
+    [_shade removeFromSuperview]; _shade = nil;
 }
 - (void)showSettings {
     _settings.hidden = !_settings.hidden;
@@ -133,15 +192,15 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
 }
 - (void)styleButton {
     UIButtonConfiguration *cfg = UIButtonConfiguration.filledButtonConfiguration;
-    cfg.title = _running ? @"停止" : @"投屏";
-    cfg.image = [UIImage systemImageNamed:_running ? @"stop.fill" : @"play.fill"];
+    cfg.title = _wanted ? @"停止" : @"投屏";
+    cfg.image = [UIImage systemImageNamed:_wanted ? @"stop.fill" : @"play.fill"];
     cfg.imagePadding = 7; cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-    cfg.baseForegroundColor = _running ? UIColor.whiteColor : Ink();
-    cfg.baseBackgroundColor = _running ? [UIColor colorWithRed:0.52 green:0.18 blue:0.15 alpha:1] : Accent();
+    cfg.baseForegroundColor = _wanted ? UIColor.whiteColor : Ink();
+    cfg.baseBackgroundColor = _wanted ? [UIColor colorWithRed:0.52 green:0.18 blue:0.15 alpha:1] : Accent();
     _button.configuration = cfg;
 }
 - (void)changeMode {
-    if (_running) [self stop:@"已停止"];
+    if (_wanted) [self stop:@"已停止"];
     BOOL local = _mode.selectedSegmentIndex == 1;
     _page.hidden = YES; _networkRow.hidden = local; _placeholder.hidden = local;
     _media.hidden = !local;
@@ -149,33 +208,93 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
     _status.text = local ? @"添加图片或视频，然后开始投屏。" : @"先在 CarWithin 启动浏览器输出。";
 }
 - (void)background:(NSNotification *)note {
-    if (_running) [self stop:@"已暂停。回到前台后可重新开始。"];
+    [self undim];
+    if (!_running || _holding) return;
+    _holding = YES;
+    NSUInteger token = _generation;
+    _backgroundTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"完成投屏过渡"
+        expirationHandler:^{
+            if (self->_holding && self->_generation == token) [self suspendSession];
+        }];
+    if (_backgroundTask == UIBackgroundTaskInvalid) [self suspendSession];
+}
+- (void)endBackgroundWindow {
+    _holding = NO;
+    if (_backgroundTask != UIBackgroundTaskInvalid) {
+        UIBackgroundTaskIdentifier task = _backgroundTask;
+        _backgroundTask = UIBackgroundTaskInvalid;
+        [UIApplication.sharedApplication endBackgroundTask:task];
+    }
+}
+- (void)suspendSession {
+    [self releaseSession:@"已暂停，回到前台后自动重连"];
+}
+- (void)active:(NSNotification *)note {
+    BOOL returning = _holding;
+    [self endBackgroundWindow];
+    if (!_wanted) return;
+    if (!_running && !_retryPending) { [self startSession]; return; }
+    if (!returning || !_running || !_frames) return;
+    // A live web view can continue where it left off. Give a stalled one a fresh session.
+    NSUInteger token = _generation, frames = _frames;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (self->_running && self->_wanted && token == self->_generation && frames == self->_frames &&
+            self->_mode.selectedSegmentIndex == 0 &&
+            UIApplication.sharedApplication.applicationState == UIApplicationStateActive)
+            [self recover:@"CarPlay 画面未恢复"];
+    });
 }
 - (void)stop:(NSString *)message {
+    _wanted = NO; _retryCount = 0;
+    [self releaseSession:message];
+}
+- (void)recover:(NSString *)reason {
+    [self releaseSession:reason];
+    if (!_wanted || UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    NSUInteger token = _generation;
+    NSUInteger delay = MIN(8u, 1u << MIN(_retryCount, (NSUInteger)3));
+    _retryCount = MIN(_retryCount+1, (NSUInteger)3);
+    _retryPending = YES;
+    _status.text = [NSString stringWithFormat:@"%@ · %lu 秒后重试",reason,(unsigned long)delay];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (!self->_wanted || token != self->_generation) return;
+        self->_retryPending = NO;
+        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive)
+            [self startSession];
+    });
+}
+- (void)releaseSession:(NSString *)message {
+    [self undim];
+    [self endBackgroundWindow];
+    _retryPending = NO;
+    _navigation = nil;
     _running = NO; _generation++; [_page stopLoading]; [_page loadHTMLString:@"" baseURL:nil];
-    _port.enabled = _rate.enabled = YES; UIApplication.sharedApplication.idleTimerDisabled = NO;
+    _port.enabled = _rate.enabled = !_wanted; UIApplication.sharedApplication.idleTimerDisabled = NO;
     [self styleButton]; _page.hidden = YES; _status.text = message;
     dispatch_async(_worker, ^{ [self->_sender stop]; });
 }
 - (void)toggle {
-    if (_running) { [self stop:@"已停止"]; return; }
+    if (_wanted) { [self stop:@"已停止"]; return; }
+    [self startSession];
+}
+- (void)startSession {
     NSInteger port = _port.text.integerValue;
     BOOL local = _mode.selectedSegmentIndex == 1;
     if (!local && (port < 1 || port > 65535)) { _status.text = @"请输入有效端口"; return; }
-    [_port resignFirstResponder]; _port.enabled = _rate.enabled = NO; _running = YES; _frames = 0;
+    _wanted = YES; [_port resignFirstResponder]; _port.enabled = _rate.enabled = NO; _running = YES; _frames = 0;
     NSUInteger generation = ++_generation;
     [self styleButton]; _page.hidden = local;
     _status.text = @"正在连接仪表 192.168.7.1…";
     UIApplication.sharedApplication.idleTimerDisabled = YES;
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%ld/",(long)port]];
-    if (!local) [_page loadRequest:[NSURLRequest requestWithURL:url]];
+    if (!local) _navigation = [_page loadRequest:[NSURLRequest requestWithURL:url]];
     dispatch_async(_worker, ^{
         NSError *err = nil;
         BOOL ok = [self->_sender startWithIPv4:@"192.168.7.1" error:&err];
         CGSize size = self->_sender.canvasSize; int fps = self->_sender.frameRate;
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self->_generation) return;
-            if (!ok) { [self stop:err.localizedDescription]; return; }
+            if (!ok) { [self recover:err.localizedDescription]; return; }
             self->_reported = fps;
             int limits[] = {30,5,10,15,20,30};
             int target = MIN(fps, limits[self->_rate.selectedSegmentIndex]);
@@ -201,18 +320,19 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
     WKWebView *source = local ? _media : _page;
     [source evaluateJavaScript:js completionHandler:^(id value,NSError *err){
         if (generation != self->_generation) return;
-        if (err) { [self stop:err.localizedDescription]; return; }
+        if (err) { [self recover:err.localizedDescription]; return; }
         NSString *encoded = [value isKindOfClass:NSString.class] ? value : nil;
         dispatch_async(self->_worker, ^{
             NSError *sendError = nil;
+            NSData *jpeg = nil;
             if (encoded) {
-                NSData *jpeg = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
+                jpeg = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
                 [self->_sender sendJPEG:jpeg error:&sendError];
             }
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (generation != self->_generation) return;
-                if (sendError) { [self stop:sendError.localizedDescription]; return; }
-                if (encoded) { self->_frames++; self->_windowFrames++; }
+                if (sendError) { [self recover:sendError.localizedDescription]; return; }
+                if (encoded) { self->_retryCount = 0; self->_frames++; self->_windowFrames++; }
                 double elapsed = CACurrentMediaTime() - self->_windowStart;
                 if (elapsed >= 1.0) {
                     self->_status.text = [NSString stringWithFormat:@"仪表 %d · 目标 %d · 实发 %.1f FPS · 共 %lu 帧",
@@ -227,8 +347,8 @@ static UIColor *Accent(void) { return [UIColor colorWithRed:1 green:0.74 blue:0.
     }];
 }
 - (void)webView:(WKWebView *)web didFailProvisionalNavigation:(WKNavigation *)nav withError:(NSError *)error {
-    if (_running && error.code != NSURLErrorCancelled)
-        [self stop:[NSString stringWithFormat:@"打开本机接收页失败：%@",error.localizedDescription]];
+    if (_running && nav == _navigation && error.code != NSURLErrorCancelled)
+        [self recover:[NSString stringWithFormat:@"打开本机接收页失败：%@",error.localizedDescription]];
 }
 @end
 
